@@ -23,6 +23,11 @@ class PricingTier:
 _DEFAULT_PRICING = PricingTier(input_rate=3.0, output_rate=15.0)
 
 PRICING_REGISTRY: dict[str, PricingTier] = {
+    # MiniMax (via Anthropic-compatible API)
+    "MiniMax-M2.7": PricingTier(0.0, 0.0),
+    "MiniMax-M2.7-highspeed": PricingTier(0.0, 0.0),
+    "MiniMax-M2.5": PricingTier(0.0, 0.0),
+    "MiniMax-M2.5-highspeed": PricingTier(0.0, 0.0),
     # Anthropic: cache_write = input * 1.25, cache_read = input * 0.10
     "claude-opus-4-6": PricingTier(5.0, 25.0, cache_write_rate=6.25, cache_read_rate=0.50),
     "claude-sonnet-4-6": PricingTier(3.0, 15.0, cache_write_rate=3.75, cache_read_rate=0.30),

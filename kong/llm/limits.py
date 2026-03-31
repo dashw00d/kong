@@ -30,6 +30,11 @@ _DEFAULT_LIMITS = ModelLimits(
 )
 
 MODEL_LIMITS: dict[str, ModelLimits] = {
+    # MiniMax — 204k token context; thinking tokens count against max_tokens so use larger output cap.
+    "MiniMax-M2.7": ModelLimits(400_000, 120, 32768),
+    "MiniMax-M2.7-highspeed": ModelLimits(400_000, 120, 32768),
+    "MiniMax-M2.5": ModelLimits(400_000, 120, 32768),
+    "MiniMax-M2.5-highspeed": ModelLimits(400_000, 120, 32768),
     # Anthropic — 200k token context (~800k chars) so 400k chars is a safe prompt cap.
     "claude-opus-4-6": _DEFAULT_LIMITS,
     "claude-sonnet-4-6": _DEFAULT_LIMITS,

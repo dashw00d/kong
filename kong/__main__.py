@@ -41,7 +41,7 @@ console = Console()
 
 
 _DEFAULT_MODELS: dict[LLMProvider, str] = {
-    LLMProvider.ANTHROPIC: "claude-opus-4-6",
+    LLMProvider.ANTHROPIC: "MiniMax-M2.7",
     LLMProvider.OPENAI: "gpt-4o",
 }
 
@@ -71,7 +71,9 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
         )
     if config.provider is LLMProvider.OPENAI:
         return OpenAIClient(model=model, api_key=config.api_key)
-    return AnthropicClient(model=model, api_key=config.api_key)
+    from kong.llm.client import DEFAULT_BASE_URL
+    base_url = config.base_url or DEFAULT_BASE_URL
+    return AnthropicClient(model=model, api_key=config.api_key, base_url=base_url)
 
 
 def _int_or_none(value: str | None) -> int | None:

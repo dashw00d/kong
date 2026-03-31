@@ -7,6 +7,7 @@ to expensive operations like Ghidra startup.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import anthropic
 import openai
@@ -61,8 +62,15 @@ def _probe_openai(config: LLMConfig) -> bool:
 
 def _probe_anthropic(config: LLMConfig) -> bool:
     try:
-        client = anthropic.Anthropic(api_key=config.api_key)
-        client.models.list()
+        from kong.llm.client import DEFAULT_BASE_URL, DEFAULT_MODEL
+        base_url = config.base_url or DEFAULT_BASE_URL
+        client = anthropic.Anthropic(api_key=config.api_key, base_url=base_url)
+        client.messages.create(
+            model=config.model or DEFAULT_MODEL,
+            max_tokens=32,
+            temperature=1.0,
+            messages=[{"role": "user", "content": "hi"}],
+        )
         return True
     except anthropic.AuthenticationError:
         logger.warning("Anthropic API key is invalid")

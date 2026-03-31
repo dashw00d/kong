@@ -19,7 +19,8 @@ from kong.llm.usage import TokenUsage
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-4-6"
+DEFAULT_MODEL = "MiniMax-M2.7"
+DEFAULT_BASE_URL = "https://api.minimax.io/anthropic"
 
 
 class AnthropicClient:
@@ -37,20 +38,31 @@ class AnthropicClient:
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
-        max_tokens: int = 2048,
+        max_tokens: int = 16384,
         api_key: str | None = None,
+        base_url: str | None = DEFAULT_BASE_URL,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
-        self._client = anthropic.Anthropic(api_key=api_key, max_retries=5)
+        self._client = anthropic.Anthropic(api_key=api_key, base_url=base_url, max_retries=5)
         self.usage = TokenUsage()
+
+    def _stream_message(self, **kwargs: Any) -> Any:
+        """Send a streaming request and return the final Message object.
+
+        Uses streaming to avoid the Anthropic SDK's 10-minute timeout on
+        long-running requests (thinking models can be slow).
+        """
+        with self._client.messages.stream(**kwargs) as stream:
+            return stream.get_final_message()
 
     def analyze_function(self, prompt: str, *, model: str | None = None) -> LLMResponse:
         """Send an analysis prompt and return parsed response (no tools)."""
         effective_model = model or self.model
-        message = self._client.messages.create(
+        message = self._stream_message(
             model=effective_model,
             max_tokens=self.max_tokens,
+            temperature=1.0,
             system=[{
                 "type": "text",
                 "text": f"{SYSTEM_PROMPT}\n\n{OUTPUT_SCHEMA}",
@@ -76,9 +88,10 @@ class AnthropicClient:
     def analyze_function_batch(self, prompt: str, *, model: str | None = None) -> list[LLMResponse]:
         """Send a batch analysis prompt and return parsed list of responses."""
         effective_model = model or self.model
-        message = self._client.messages.create(
+        message = self._stream_message(
             model=effective_model,
-            max_tokens=16384,
+            max_tokens=32768,
+            temperature=1.0,
             system=[{
                 "type": "text",
                 "text": f"{BATCH_SYSTEM_PROMPT}\n\n{BATCH_OUTPUT_SCHEMA}",
@@ -127,9 +140,10 @@ class AnthropicClient:
         total_output = 0
 
         for _ in range(max_rounds):
-            message = self._client.messages.create(
+            message = self._stream_message(
                 model=self.model,
                 max_tokens=self.max_tokens,
+                temperature=1.0,
                 system=cached_system,
                 tools=tools,
                 messages=messages,
