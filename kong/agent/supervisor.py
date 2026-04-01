@@ -254,7 +254,25 @@ class Supervisor:
                 completed_count += 1
                 continue
 
-            decompilation = self._get_decompilation(func.address)
+            try:
+                decompilation = self._get_decompilation(func.address)
+            except Exception as e:
+                self._emit(Event(
+                    type=EventType.FUNCTION_ERROR,
+                    phase=Phase.ANALYSIS,
+                    message=f"Decompilation failed for {func.name} ({func.address_hex}), skipping",
+                    data={"address": func.address, "error": str(e)},
+                ))
+                result = FunctionResult(
+                    address=func.address,
+                    original_name=func.name,
+                    error=f"Decompilation failed: {e}",
+                )
+                self.results[func.address] = result
+                self.stats.record_result(result)
+                completed_count += 1
+                continue
+
             techniques = classify_obfuscation(decompilation)
 
             if techniques:
