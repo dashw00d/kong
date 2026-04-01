@@ -195,10 +195,16 @@ class GhidraClient:
             di.openProgram(self.program)
             result = di.decompileFunction(func, 30, ConsoleTaskMonitor())
             if not result.decompileCompleted():
-                raise GhidraClientError(f"Decompilation failed for function at 0x{addr:08x}")
+                err = result.getErrorMessage() or "unknown error"
+                raise GhidraClientError(
+                    f"Decompilation failed for function at 0x{addr:08x}: {err}"
+                )
             decomp_func = result.getDecompiledFunction()
             if decomp_func is None:
-                raise GhidraClientError(f"Decompilation failed for function at 0x{addr:08x}")
+                err = result.getErrorMessage() or "no decompiled output"
+                raise GhidraClientError(
+                    f"Decompilation failed for function at 0x{addr:08x}: {err}"
+                )
             return str(decomp_func.getC())
         finally:
             di.dispose()
