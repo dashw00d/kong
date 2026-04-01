@@ -28,6 +28,7 @@ class GhidraConfig:
     install_dir: str | None = None
     project_dir: str = "/tmp/kong_ghidra"
     project_name: str = "kong_project"
+    jvm_heap: str = "16g"
 
     def __post_init__(self) -> None:
         if self.install_dir is None:

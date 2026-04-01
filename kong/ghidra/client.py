@@ -60,14 +60,21 @@ class GhidraClient:
             decomp = client.get_decompilation(funcs[0].address)
     """
 
-    def __init__(self, binary_path: str, install_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        binary_path: str,
+        install_dir: str | None = None,
+        jvm_heap: str = "4g",
+    ) -> None:
         self.binary_path = str(Path(binary_path).resolve())
         if install_dir is None:
             install_dir = find_ghidra_install()
         self.install_dir = install_dir
+        self.jvm_heap = jvm_heap
         self._program: Any = None
         self._flat_api: Any = None
         self._ctx: Any = None  # context manager from open_program
+        self._decomp_interface: Any = None
 
     @property
     def program(self) -> Any:
@@ -81,13 +88,29 @@ class GhidraClient:
             raise GhidraClientError("Not open. Call open() first.")
         return self._flat_api
 
+    @property
+    def decomp_interface(self) -> Any:
+        """Lazily create and cache a shared DecompInterface."""
+        if self._decomp_interface is None:
+            from ghidra.app.decompiler import DecompInterface
+            di = DecompInterface()
+            di.openProgram(self.program)
+            self._decomp_interface = di
+        return self._decomp_interface
+
     def open(self) -> GhidraClient:
         """Start PyGhidra JVM and open the binary for analysis."""
         if not Path(self.binary_path).exists():
             raise GhidraClientError(f"Binary not found: {self.binary_path}")
 
         logger.info("Starting PyGhidra JVM ...")
-        pyghidra.start(install_dir=self.install_dir)
+        if not pyghidra.started():
+            from pyghidra.launcher import HeadlessPyGhidraLauncher
+            launcher = HeadlessPyGhidraLauncher(install_dir=self.install_dir)
+            launcher.add_vmargs(f"-Xmx{self.jvm_heap}")
+            launcher.start()
+        else:
+            pyghidra.start(install_dir=self.install_dir)
 
         logger.info("Opening program: %s", self.binary_path)
         self._ctx = pyghidra.open_program(self.binary_path)
@@ -98,6 +121,12 @@ class GhidraClient:
 
     def close(self) -> None:
         """Close the program and release resources."""
+        if self._decomp_interface is not None:
+            try:
+                self._decomp_interface.dispose()
+            except Exception:
+                logger.debug("Error disposing DecompInterface", exc_info=True)
+            self._decomp_interface = None
         if self._ctx is not None:
             try:
                 self._ctx.__exit__(None, None, None)
@@ -184,30 +213,26 @@ class GhidraClient:
             classification=_classify(size, is_thunk),
         )
 
-    def get_decompilation(self, addr: int) -> str:
+    def get_decompilation(self, addr: int, timeout: int = 60) -> str:
         """Get the decompiled C source for a function."""
-        from ghidra.app.decompiler import DecompInterface
         from ghidra.util.task import ConsoleTaskMonitor
 
         func = self._get_function_at(addr)
-        di = DecompInterface()
-        try:
-            di.openProgram(self.program)
-            result = di.decompileFunction(func, 30, ConsoleTaskMonitor())
-            if not result.decompileCompleted():
-                err = result.getErrorMessage() or "unknown error"
-                raise GhidraClientError(
-                    f"Decompilation failed for function at 0x{addr:08x}: {err}"
-                )
-            decomp_func = result.getDecompiledFunction()
-            if decomp_func is None:
-                err = result.getErrorMessage() or "no decompiled output"
-                raise GhidraClientError(
-                    f"Decompilation failed for function at 0x{addr:08x}: {err}"
-                )
-            return str(decomp_func.getC())
-        finally:
-            di.dispose()
+        result = self.decomp_interface.decompileFunction(
+            func, timeout, ConsoleTaskMonitor()
+        )
+        if not result.decompileCompleted():
+            err = result.getErrorMessage() or "unknown error"
+            raise GhidraClientError(
+                f"Decompilation failed for function at 0x{addr:08x}: {err}"
+            )
+        decomp_func = result.getDecompiledFunction()
+        if decomp_func is None:
+            err = result.getErrorMessage() or "no decompiled output"
+            raise GhidraClientError(
+                f"Decompilation failed for function at 0x{addr:08x}: {err}"
+            )
+        return str(decomp_func.getC())
 
     def get_xrefs_to(self, addr: int) -> list[XRef]:
         """Get all cross-references TO a given address."""
@@ -626,41 +651,37 @@ class GhidraClient:
 
     def get_pcode_ops(self, addr: int) -> list[PcodeOp]:
         """Get high-level pcode operations for the function at addr."""
-        from ghidra.app.decompiler import DecompInterface
         from ghidra.util.task import ConsoleTaskMonitor
 
         func = self._get_function_at(addr)
-        di = DecompInterface()
-        try:
-            di.openProgram(self.program)
-            result = di.decompileFunction(func, 30, ConsoleTaskMonitor())
-            if not result.decompileCompleted():
-                raise GhidraClientError(
-                    f"Decompilation failed for pcode at 0x{addr:08x}"
-                )
-            high_func = result.getHighFunction()
-            if high_func is None:
-                return []
+        result = self.decomp_interface.decompileFunction(
+            func, 60, ConsoleTaskMonitor()
+        )
+        if not result.decompileCompleted():
+            raise GhidraClientError(
+                f"Decompilation failed for pcode at 0x{addr:08x}"
+            )
+        high_func = result.getHighFunction()
+        if high_func is None:
+            return []
 
-            ops: list[PcodeOp] = []
-            op_iter = high_func.getPcodeOps()
-            while op_iter.hasNext():
-                op = op_iter.next()
-                mnemonic = str(op.getMnemonic())
-                op_addr = int(op.getSeqnum().getTarget().getOffset())
-                inputs = [
-                    str(op.getInput(i)) for i in range(op.getNumInputs())
-                ]
-                output = str(op.getOutput()) if op.getOutput() is not None else ""
-                ops.append(PcodeOp(
-                    mnemonic=mnemonic,
-                    address=op_addr,
-                    inputs=inputs,
-                    output=output,
-                ))
-            return ops
-        finally:
-            di.dispose()
+        ops: list[PcodeOp] = []
+        op_iter = high_func.getPcodeOps()
+        while op_iter.hasNext():
+            op = op_iter.next()
+            mnemonic = str(op.getMnemonic())
+            op_addr = int(op.getSeqnum().getTarget().getOffset())
+            inputs = [
+                str(op.getInput(i)) for i in range(op.getNumInputs())
+            ]
+            output = str(op.getOutput()) if op.getOutput() is not None else ""
+            ops.append(PcodeOp(
+                mnemonic=mnemonic,
+                address=op_addr,
+                inputs=inputs,
+                output=output,
+            ))
+        return ops
 
     def _disassemble_range(self, start: int, end: int) -> list[str]:
         """Get disassembly text for instructions in an address range."""

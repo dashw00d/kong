@@ -260,7 +260,7 @@ class Supervisor:
                 self._emit(Event(
                     type=EventType.FUNCTION_ERROR,
                     phase=Phase.ANALYSIS,
-                    message=f"Decompilation failed for {func.name} ({func.address_hex}), skipping",
+                    message=f"Decompilation failed for {func.name} ({func.address_hex}): {e}",
                     data={"address": func.address, "error": str(e)},
                 ))
                 result = FunctionResult(

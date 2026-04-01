@@ -208,6 +208,7 @@ def _print_final_stats(supervisor: Supervisor, llm_client: LLMClient) -> None:
     help="Output formats.",
 )
 @click.option("--ghidra-dir", default=None, help="Ghidra installation directory.")
+@click.option("--jvm-heap", default=None, help="JVM heap size for Ghidra (e.g. 4g, 16g). Default: 4g.")
 @click.option(
     "--provider", "-p",
     type=click.Choice([p.value for p in LLMProvider], case_sensitive=False),
@@ -227,6 +228,7 @@ def analyze(
     output: str,
     formats: tuple[str, ...],
     ghidra_dir: str | None,
+    jvm_heap: str | None,
     provider: str | None,
     model: str | None,
     base_url: str | None,
@@ -268,7 +270,10 @@ def analyze(
             max_output_tokens = _int_or_none(custom_db.get("custom_max_output_tokens"))
 
     config = KongConfig(
-        ghidra=GhidraConfig(install_dir=ghidra_dir),
+        ghidra=GhidraConfig(
+            install_dir=ghidra_dir,
+            **({"jvm_heap": jvm_heap} if jvm_heap else {}),
+        ),
         llm=LLMConfig(
             provider=llm_provider,
             model=model,
@@ -319,6 +324,7 @@ def analyze(
             client = GhidraClient(
                 binary_path=str(binary_path),
                 install_dir=config.ghidra.install_dir,
+                jvm_heap=config.ghidra.jvm_heap,
             )
             client.open()
     except GhidraClientError as e:
@@ -382,6 +388,7 @@ def info(binary: str, ghidra_dir: str | None) -> None:
         client = GhidraClient(
             binary_path=str(Path(binary).resolve()),
             install_dir=ghidra_config.install_dir,
+            jvm_heap=ghidra_config.jvm_heap,
         )
         client.open()
     except GhidraClientError as e:
