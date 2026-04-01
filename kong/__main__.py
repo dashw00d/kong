@@ -342,14 +342,7 @@ def analyze(
             raise SystemExit(1)
 
     try:
-        binary_stem = binary_path.stem
-        project_marker = binary_path.parent / f"{binary_stem}_kong" / "kong" / "kong.gpr"
-        if project_marker.exists():
-            status_msg = "[bold green]Reopening existing Ghidra project ..."
-        else:
-            status_msg = "[bold green]Opening binary in Ghidra (first run — this may take a while) ..."
-
-        with console.status(status_msg):
+        with console.status("[bold green]Opening binary in Ghidra ..."):
             client = GhidraClient(
                 binary_path=str(binary_path),
                 install_dir=config.ghidra.install_dir,

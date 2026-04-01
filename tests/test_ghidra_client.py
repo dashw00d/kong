@@ -64,21 +64,16 @@ def mock_pyghidra():
 
 @pytest.fixture
 def client(mock_pyghidra, tmp_path):
-    """Create an opened GhidraClient with mocked pyghidra."""
+    """Create a GhidraClient with mocked internals (no JVM needed)."""
     binary = tmp_path / "test_binary"
     binary.write_bytes(b"\x00" * 16)
 
     prog = _mock_program()
-    flat_api = MagicMock()
-    flat_api.getCurrentProgram.return_value = prog
-
-    ctx = MagicMock()
-    ctx.__enter__ = MagicMock(return_value=flat_api)
-    ctx.__exit__ = MagicMock(return_value=False)
-    mock_pyghidra.open_program.return_value = ctx
 
     c = GhidraClient(str(binary))
-    c.open()
+    c._program = prog
+    c._flat_api = MagicMock()
+    c._project = MagicMock()
     return c
 
 
@@ -100,23 +95,12 @@ class TestConnection:
         with pytest.raises(GhidraClientError, match="Binary not found"):
             c.open()
 
-    def test_context_manager(self, mock_pyghidra, tmp_path):
-        binary = tmp_path / "test_binary"
-        binary.write_bytes(b"\x00" * 16)
-
-        prog = _mock_program()
-        flat_api = MagicMock()
-        flat_api.getCurrentProgram.return_value = prog
-
-        ctx = MagicMock()
-        ctx.__enter__ = MagicMock(return_value=flat_api)
-        ctx.__exit__ = MagicMock(return_value=False)
-        mock_pyghidra.open_program.return_value = ctx
-
-        with GhidraClient(str(binary)) as c:
-            assert c._program is not None
-        # After exit, state is cleared
-        assert c._program is None
+    def test_close_clears_project(self, client):
+        assert client._project is not None
+        client.close()
+        assert client._program is None
+        assert client._flat_api is None
+        assert client._project is None
 
 
 class TestBinaryInfo:

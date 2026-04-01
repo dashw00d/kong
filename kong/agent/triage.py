@@ -87,7 +87,7 @@ class TriageAgent:
     def run(self) -> TriageResult:
         """Execute the full triage phase."""
         binary_info = self.client.get_binary_info()
-        functions = self.client.list_functions()
+        functions = self.client.list_functions(sections=binary_info.sections)
         strings = self.client.get_strings()
 
         call_graph = self._build_call_graph(functions)

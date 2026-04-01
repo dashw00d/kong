@@ -201,11 +201,15 @@ class Supervisor:
         return loaded
 
     def _save_state(self) -> None:
-        """Save current results for resumption."""
+        """Save all progress — Kong results AND Ghidra project — so kills don't lose work."""
         try:
             save_state(self.results, self.config.output.directory)
         except Exception as e:
             logger.warning("Failed to save state: %s", e)
+        try:
+            self.client.save_project()
+        except Exception as e:
+            logger.warning("Failed to save Ghidra project: %s", e)
 
     def run(self) -> dict[int, FunctionResult]:
         """Run the full analysis pipeline. Returns addr -> FunctionResult."""
@@ -388,6 +392,10 @@ class Supervisor:
                 f"{self.stats.signature_matches} pre-labeled."
             ),
         ))
+
+        # Save Ghidra project immediately after triage so the expensive
+        # auto-analysis survives if the process gets killed
+        self._save_state()
 
     def _run_analysis(self) -> None:
         """Analyze functions in large chunks via sequential LLM calls."""

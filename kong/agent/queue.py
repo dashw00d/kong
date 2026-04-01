@@ -52,6 +52,7 @@ class WorkQueue:
             skip_classifications = {
                 FunctionClassification.IMPORTED,
                 FunctionClassification.THUNK,
+                FunctionClassification.PACKED_SECTION,
             }
 
         analyzable = {

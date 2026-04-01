@@ -75,7 +75,7 @@ class GhidraClient:
         self.jvm_heap = jvm_heap
         self._program: Any = None
         self._flat_api: Any = None
-        self._ctx: Any = None  # context manager from open_program
+        self._project: Any = None
         self._decomp_interface: Any = None
 
     @property
@@ -119,27 +119,54 @@ class GhidraClient:
         else:
             pyghidra.start(install_dir=self.install_dir)
 
+        # Manage the Ghidra project lifecycle directly (not via pyghidra's
+        # context manager) so we can call project.save(program) at any time.
+        from pyghidra.core import _setup_project, _analyze_program
+        from ghidra.program.flatapi import FlatProgramAPI
+        from ghidra.app.script import GhidraScriptUtil
+
         logger.info("Opening program: %s", self.binary_path)
         binary_name = Path(self.binary_path).stem
         project_location = Path(self.binary_path).parent / f"{binary_name}_kong"
         self._clean_stale_locks(project_location)
 
-        # Check if this is a re-open (project exists) or first import
-        project_marker = project_location / "kong" / "kong.gpr"
-        if project_marker.exists():
-            logger.info("Found existing Ghidra project — reusing analysis")
-        else:
-            logger.info("No existing project — will import and analyze (this is slow)")
-
-        self._ctx = pyghidra.open_program(
+        self._project, self._program = _setup_project(
             self.binary_path,
             project_location=str(project_location),
             project_name="kong",
         )
-        self._flat_api = self._ctx.__enter__()
-        self._program = self._flat_api.getCurrentProgram()
-        logger.info("Program loaded: %s", self._program.getName())
+        GhidraScriptUtil.acquireBundleHostReference()
+        self._flat_api = FlatProgramAPI(self._program)
+
+        # Check if analysis is needed
+        func_count = self._program.getFunctionManager().getFunctionCount()
+        if func_count < 100:
+            if func_count > 0:
+                logger.warning(
+                    "Project has only %d functions — incomplete. Re-analyzing...",
+                    func_count,
+                )
+            else:
+                logger.info("New project — running Ghidra auto-analysis (this is slow)")
+            _analyze_program(self._flat_api, self._program)
+            self.save_project()
+            func_count = self._program.getFunctionManager().getFunctionCount()
+
+        logger.info(
+            "Program loaded: %s (%d functions)",
+            self._program.getName(), func_count,
+        )
         return self
+
+    def save_project(self) -> None:
+        """Flush the Ghidra project to disk so progress survives kills."""
+        if self._project is None or self._program is None:
+            return
+        try:
+            self._project.save(self._program)
+            logger.info("Ghidra project saved to disk")
+        except Exception:
+            logger.debug("Failed to save Ghidra project", exc_info=True)
 
     def close(self) -> None:
         """Close the program and release resources."""
@@ -149,12 +176,21 @@ class GhidraClient:
             except Exception:
                 logger.debug("Error disposing DecompInterface", exc_info=True)
             self._decomp_interface = None
-        if self._ctx is not None:
+        if self._project is not None:
             try:
-                self._ctx.__exit__(None, None, None)
+                self._project.save(self._program)
             except Exception:
-                logger.debug("Error closing program context", exc_info=True)
-            self._ctx = None
+                logger.debug("Error saving Ghidra project on close", exc_info=True)
+            try:
+                from ghidra.app.script import GhidraScriptUtil
+                GhidraScriptUtil.releaseBundleHostReference()
+            except Exception:
+                pass
+            try:
+                self._project.close()
+            except Exception:
+                logger.debug("Error closing Ghidra project", exc_info=True)
+            self._project = None
         self._program = None
         self._flat_api = None
 
@@ -308,21 +344,61 @@ class GhidraClient:
 
         return info
 
-    def list_functions(self) -> list[FunctionInfo]:
-        """List all functions in the binary."""
+    def list_functions(self, sections: list[SectionInfo] | None = None) -> list[FunctionInfo]:
+        """List all functions in the binary.
+
+        If sections are provided, functions in non-standard sections
+        are classified as PACKED_SECTION so they can be skipped.
+        """
+        junk_ranges: list[tuple[int, int]] = []
+        if sections:
+            # Standard PE sections that contain real analyzable code/data
+            standard_sections = {
+                ".text", ".code", "CODE", ".rdata", ".data", ".bss",
+                ".idata", ".edata", ".pdata", ".rsrc", ".reloc",
+                ".tls", ".gfids", ".gehcont", ".00cfg",
+            }
+            for s in sections:
+                if s.name not in standard_sections:
+                    junk_ranges.append(
+                        (s.virtual_address, s.virtual_address + s.virtual_size)
+                    )
+                    logger.info(
+                        "Marking section '%s' (0x%x-0x%x) as non-standard — "
+                        "functions will be skipped",
+                        s.name, s.virtual_address,
+                        s.virtual_address + s.virtual_size,
+                    )
+
+        def _in_junk(addr: int) -> bool:
+            return any(start <= addr < end for start, end in junk_ranges)
+
         fm = self.program.getFunctionManager()
         functions: list[FunctionInfo] = []
+        junk_count = 0
         for func in fm.getFunctions(True):
+            addr = int(func.getEntryPoint().getOffset())
             size = int(func.getBody().getNumAddresses())
             is_thunk = bool(func.isThunk())
+            if junk_ranges and _in_junk(addr):
+                classification = FunctionClassification.PACKED_SECTION
+                junk_count += 1
+            else:
+                classification = _classify(size, is_thunk)
             functions.append(
                 FunctionInfo(
-                    address=int(func.getEntryPoint().getOffset()),
+                    address=addr,
                     name=str(func.getName()),
                     size=size,
                     is_thunk=is_thunk,
-                    classification=_classify(size, is_thunk),
+                    classification=classification,
                 )
+            )
+
+        if junk_count:
+            logger.info(
+                "Filtered %d/%d functions in non-standard sections",
+                junk_count, len(functions),
             )
         return functions
 
@@ -363,7 +439,7 @@ class GhidraClient:
             classification=_classify(size, is_thunk),
         )
 
-    def get_decompilation(self, addr: int, timeout: int = 60) -> str:
+    def get_decompilation(self, addr: int, timeout: int = 120) -> str:
         """Get the decompiled C source for a function."""
         from ghidra.util.task import ConsoleTaskMonitor
 

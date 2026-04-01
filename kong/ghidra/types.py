@@ -13,6 +13,7 @@ class FunctionClassification(Enum):
     SMALL = "small"
     MEDIUM = "medium"
     LARGE = "large"
+    PACKED_SECTION = "packed_section"
 
 
 @dataclass
