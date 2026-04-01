@@ -30,6 +30,8 @@ dependencies = [
     "pyghidra>=2.2.1",
     "jpype1>=1.6.0",
     "json-repair>=0.58.5",
+    "pefile>=2023.2.7",
+    "speakeasy-emulator>=1.5",
 ]
 
 [project.urls]

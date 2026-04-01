@@ -76,6 +76,29 @@ class StringEntry:
 
 
 @dataclass
+class SectionInfo:
+    """A memory section/segment in the binary."""
+    name: str
+    virtual_address: int
+    virtual_size: int
+    raw_size: int
+    is_executable: bool = False
+    is_initialized: bool = False
+    entropy: float = 0.0
+
+
+@dataclass
+class PackingInfo:
+    """Packing/obfuscation analysis results."""
+    is_packed: bool = False
+    confidence: float = 0.0  # 0.0 - 1.0
+    indicators: list[str] = field(default_factory=list)
+    empty_code_sections: list[str] = field(default_factory=list)
+    high_entropy_sections: list[str] = field(default_factory=list)
+    entry_section: str = ""
+
+
+@dataclass
 class BinaryInfo:
     arch: str
     format: str
@@ -86,6 +109,8 @@ class BinaryInfo:
     path: str = ""
     min_address: int = 0
     max_address: int = 0
+    sections: list[SectionInfo] = field(default_factory=list)
+    packing: PackingInfo | None = None
 
 
 @dataclass

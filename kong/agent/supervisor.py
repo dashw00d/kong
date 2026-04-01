@@ -26,9 +26,14 @@ from kong.ghidra.types import BinaryInfo, FunctionInfo, StringEntry
 from kong.llm.limits import ModelLimits, get_model_limits
 from kong.llm.usage import TokenUsage
 from kong.normalizer.syntactic import normalize
+from kong.state import load_state, save_state
 from kong.synthesis.semantic import SemanticSynthesizer, SynthesisResult
 
 logger = logging.getLogger(__name__)
+
+
+class PackedBinaryError(Exception):
+    """Raised when a packed/encrypted binary is detected."""
 
 
 def _clean_api_error(exc: Exception) -> str:
@@ -79,6 +84,68 @@ class Supervisor:
         self._resume_event.set()
         self._decompilation_cache: dict[int, str] = {}
         self._functions_by_addr: dict[int, FunctionInfo] = {}
+        self._packed: bool = False
+
+    def _try_unpack(self) -> bool:
+        """Attempt automatic unpacking. Returns True if successful and client was reloaded."""
+        from kong.unpack import UnpackError, unpack_pe
+
+        self._emit(Event(
+            type=EventType.PHASE_START,
+            phase=Phase.TRIAGE,
+            message="Attempting automatic unpacking via emulation...",
+        ))
+
+        try:
+            unpacked_path = unpack_pe(self.client.binary_path)
+        except UnpackError as e:
+            self._emit(Event(
+                type=EventType.RUN_ERROR,
+                phase=Phase.TRIAGE,
+                message=f"Automatic unpacking failed: {e}",
+            ))
+            return False
+
+        self._emit(Event(
+            type=EventType.PHASE_COMPLETE,
+            phase=Phase.TRIAGE,
+            message=f"Unpacked binary written to: {unpacked_path}",
+        ))
+
+        # Reload with the unpacked binary
+        self._emit(Event(
+            type=EventType.PHASE_START,
+            phase=Phase.TRIAGE,
+            message="Reloading unpacked binary in Ghidra...",
+        ))
+        try:
+            self.client.close()
+            self.client.binary_path = str(unpacked_path)
+            self.client.open()
+        except Exception as e:
+            self._emit(Event(
+                type=EventType.RUN_ERROR,
+                phase=Phase.TRIAGE,
+                message=f"Failed to reload unpacked binary: {e}",
+            ))
+            return False
+
+        # Re-run triage on the unpacked binary
+        self._packed = False
+        self.results.clear()
+        self.stats = AnalysisStats()
+        self.stats.start_time = time.time()
+        self._run_triage()
+
+        if self._packed:
+            self._emit(Event(
+                type=EventType.RUN_ERROR,
+                phase=Phase.TRIAGE,
+                message="Unpacked binary still appears packed. Manual unpacking required.",
+            ))
+            return False
+
+        return True
 
     def _get_decompilation(self, addr: int) -> str:
         if addr not in self._decompilation_cache:
@@ -113,6 +180,33 @@ class Supervisor:
         """Trigger export manually (e.g. from TUI keybind)."""
         self._run_export()
 
+    def _load_previous_results(self) -> int:
+        """Load results from a previous run. Returns count loaded."""
+        previous = load_state(self.config.output.directory)
+        if not previous:
+            return 0
+
+        loaded = 0
+        for addr, result in previous.items():
+            # Keep high-confidence results and signature matches as-is
+            if result.confidence >= 80 and not result.error:
+                self.results[addr] = result
+                loaded += 1
+            # Keep signature matches (they don't change)
+            elif result.skipped and result.skip_reason:
+                self.results[addr] = result
+                loaded += 1
+            # Everything else (low confidence, errors) gets re-analyzed
+
+        return loaded
+
+    def _save_state(self) -> None:
+        """Save current results for resumption."""
+        try:
+            save_state(self.results, self.config.output.directory)
+        except Exception as e:
+            logger.warning("Failed to save state: %s", e)
+
     def run(self) -> dict[int, FunctionResult]:
         """Run the full analysis pipeline. Returns addr -> FunctionResult."""
         self.stats.start_time = time.time()
@@ -121,14 +215,41 @@ class Supervisor:
             message="Kong analysis starting.",
         ))
 
+        resumed = self._load_previous_results()
+        if resumed:
+            self._emit(Event(
+                type=EventType.RUN_START,
+                message=f"Resumed {resumed} results from previous run.",
+                data={"resumed": resumed},
+            ))
+
         try:
             self._run_triage()
+            if self._packed:
+                unpacked = self._try_unpack()
+                if not unpacked:
+                    raise PackedBinaryError(
+                        "Binary is packed/encrypted and automatic unpacking failed. "
+                        "Unpack the binary manually (run it in a sandbox, dump with pe-sieve), "
+                        "then re-run Kong with: kong analyze <dumped_binary>"
+                    )
             self._run_analysis()
+            self._save_state()
             self._run_cleanup()
             self._run_synthesis()
             self._reanalyze_low_confidence()
+            self._save_state()
             self._run_export()
+        except KeyboardInterrupt:
+            self._save_state()
+            self._emit(Event(
+                type=EventType.RUN_ERROR,
+                message=f"Interrupted — saved {len(self.results)} results.",
+                data={"saved": len(self.results)},
+            ))
+            raise
         except Exception as e:
+            self._save_state()
             self._emit(Event(
                 type=EventType.RUN_ERROR,
                 message=f"Fatal error: {e}",
@@ -239,6 +360,26 @@ class Supervisor:
                 data={"language": result.language_hints.language},
             ))
 
+        packing = self.binary_info.packing
+        if packing and packing.is_packed:
+            for indicator in packing.indicators:
+                self._emit(Event(
+                    type=EventType.RUN_ERROR,
+                    phase=Phase.TRIAGE,
+                    message=f"Packing detected: {indicator}",
+                ))
+            self._emit(Event(
+                type=EventType.RUN_ERROR,
+                phase=Phase.TRIAGE,
+                message=(
+                    f"Binary appears to be packed/encrypted "
+                    f"(confidence: {packing.confidence:.0%}). "
+                    f"Static analysis will produce mostly garbage results. "
+                    f"Provide an unpacked memory dump with --dump for accurate analysis."
+                ),
+            ))
+            self._packed = True
+
         self._emit(Event(
             type=EventType.PHASE_COMPLETE,
             phase=Phase.TRIAGE,
@@ -264,7 +405,7 @@ class Supervisor:
         for item in all_items:
             func = item.function
 
-            # Skip functions already resolved by signature matching during triage.
+            # Skip functions already resolved (signature match, previous run, etc.)
             if func.address in self.results:
                 completed_count += 1
                 continue
@@ -547,6 +688,7 @@ class Supervisor:
                 chunk_num, total_chunks, matched, len(chunk),
             )
             processed += len(chunk)
+            self._save_state()
 
     def _build_chunk_prompt(self, items: list[tuple[WorkItem, str]]) -> str:
         """Build a prompt with all decompilations for this chunk."""
@@ -620,6 +762,8 @@ class Supervisor:
 
         return result
 
+    _SAVE_INTERVAL = 50  # save state every N results
+
     def _record_analysis_result(self, func: FunctionInfo, result: FunctionResult) -> None:
         """Record a function result into the results dict and stats."""
         self.results[func.address] = result
@@ -627,6 +771,10 @@ class Supervisor:
 
         if result.struct_proposals:
             self.struct_accumulator.add_proposals(func.address, result.struct_proposals)
+
+        # Periodically save state so progress survives crashes
+        if self.stats.analyzed % self._SAVE_INTERVAL == 0 and self.stats.analyzed > 0:
+            self._save_state()
 
         if not result.error and not result.skipped:
             self._emit(Event(

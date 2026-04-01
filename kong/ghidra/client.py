@@ -20,8 +20,10 @@ from kong.ghidra.types import (
     ControlFlowGraph,
     FunctionClassification,
     FunctionInfo,
+    PackingInfo,
     ParameterInfo,
     PcodeOp,
+    SectionInfo,
     StringEntry,
     StructDefinition,
     StructField,
@@ -118,7 +120,22 @@ class GhidraClient:
             pyghidra.start(install_dir=self.install_dir)
 
         logger.info("Opening program: %s", self.binary_path)
-        self._ctx = pyghidra.open_program(self.binary_path)
+        binary_name = Path(self.binary_path).stem
+        project_location = Path(self.binary_path).parent / f"{binary_name}_kong"
+        self._clean_stale_locks(project_location)
+
+        # Check if this is a re-open (project exists) or first import
+        project_marker = project_location / "kong" / "kong.gpr"
+        if project_marker.exists():
+            logger.info("Found existing Ghidra project — reusing analysis")
+        else:
+            logger.info("No existing project — will import and analyze (this is slow)")
+
+        self._ctx = pyghidra.open_program(
+            self.binary_path,
+            project_location=str(project_location),
+            project_name="kong",
+        )
         self._flat_api = self._ctx.__enter__()
         self._program = self._flat_api.getCurrentProgram()
         logger.info("Program loaded: %s", self._program.getName())
@@ -141,6 +158,22 @@ class GhidraClient:
         self._program = None
         self._flat_api = None
 
+    @staticmethod
+    def _clean_stale_locks(project_location: Path) -> None:
+        """Remove stale .lock files from a Ghidra project directory.
+
+        Ghidra creates .lock files when a project is open. If the process
+        crashes, these persist and block the next run from opening the project.
+        """
+        if not project_location.exists():
+            return
+        for lock_file in project_location.rglob("*.lock"):
+            logger.info("Removing stale lock file: %s", lock_file)
+            try:
+                lock_file.unlink()
+            except OSError:
+                logger.warning("Could not remove lock file: %s", lock_file)
+
     def __enter__(self) -> GhidraClient:
         return self.open()
 
@@ -151,6 +184,8 @@ class GhidraClient:
         """Get metadata about the loaded binary."""
         prog = self.program
         lang = prog.getLanguage()
+        sections = self.get_sections()
+        packing = self.detect_packing(sections)
         return BinaryInfo(
             name=str(prog.getName()),
             path=str(prog.getExecutablePath()),
@@ -161,7 +196,117 @@ class GhidraClient:
             compiler=str(prog.getCompilerSpec().getCompilerSpecID()),
             min_address=int(prog.getMinAddress().getOffset()),
             max_address=int(prog.getMaxAddress().getOffset()),
+            sections=sections,
+            packing=packing,
         )
+
+    def get_sections(self) -> list[SectionInfo]:
+        """Get PE sections / memory blocks from the binary."""
+        import math
+        from collections import Counter
+
+        memory = self.program.getMemory()
+        sections: list[SectionInfo] = []
+        for block in memory.getBlocks():
+            name = str(block.getName())
+            start = int(block.getStart().getOffset())
+            size = int(block.getSize())
+            is_exec = bool(block.isExecute())
+            is_init = bool(block.isInitialized())
+
+            entropy = 0.0
+            if is_init and size > 0:
+                try:
+                    raw = bytearray(size)
+                    block.getBytes(block.getStart(), raw)
+                    counts = Counter(raw)
+                    total = len(raw)
+                    entropy = -sum(
+                        (c / total) * math.log2(c / total)
+                        for c in counts.values() if c > 0
+                    )
+                except Exception:
+                    pass
+
+            sections.append(SectionInfo(
+                name=name,
+                virtual_address=start,
+                virtual_size=size,
+                raw_size=size if is_init else 0,
+                is_executable=is_exec,
+                is_initialized=is_init,
+                entropy=entropy,
+            ))
+        return sections
+
+    def detect_packing(self, sections: list[SectionInfo]) -> PackingInfo:
+        """Analyze sections for signs of packing/encryption."""
+        info = PackingInfo()
+
+        # Check for empty code sections (VSize > 0 but uninitialized)
+        code_section_names = {".text", ".code", "CODE"}
+        for s in sections:
+            if s.name in code_section_names or (s.is_executable and s.name.startswith(".")):
+                if not s.is_initialized and s.virtual_size > 0:
+                    info.empty_code_sections.append(s.name)
+                    info.indicators.append(
+                        f"Section '{s.name}' has virtual size 0x{s.virtual_size:x} "
+                        f"but no raw data (uninitialized)"
+                    )
+
+        # Check for high-entropy sections (> 7.0 = likely encrypted/compressed)
+        for s in sections:
+            if s.entropy > 7.0 and s.raw_size > 1024:
+                info.high_entropy_sections.append(s.name)
+                info.indicators.append(
+                    f"Section '{s.name}' has very high entropy ({s.entropy:.2f}/8.0) — "
+                    f"likely encrypted or compressed"
+                )
+
+        # Check if entry point is in an unusual section
+        ep = int(self.program.getImageBase().getOffset()) + \
+            int(self.program.getMemory().getMinAddress().getOffset())
+        # Actually, let's get the real entry point from the listing
+        try:
+            entry_func = None
+            fm = self.program.getFunctionManager()
+            for sym in self.program.getSymbolTable().getExternalEntryPointIterator():
+                entry_func = fm.getFunctionAt(sym)
+                if entry_func:
+                    break
+            if entry_func is None:
+                # Try the conventional entry point
+                entry_addr = self.program.getMinAddress()
+                for func in fm.getFunctions(True):
+                    if "entry" in str(func.getName()).lower():
+                        entry_func = func
+                        break
+            if entry_func:
+                ep_addr = int(entry_func.getEntryPoint().getOffset())
+                for s in sections:
+                    if s.virtual_address <= ep_addr < s.virtual_address + s.virtual_size:
+                        info.entry_section = s.name
+                        if s.name not in (".text", ".code", "CODE"):
+                            info.indicators.append(
+                                f"Entry point is in unusual section '{s.name}' "
+                                f"(expected .text)"
+                            )
+                        break
+        except Exception:
+            pass
+
+        # Determine if packed
+        if info.empty_code_sections:
+            info.is_packed = True
+            info.confidence = 0.95
+        elif len(info.high_entropy_sections) >= 2:
+            info.is_packed = True
+            info.confidence = 0.8
+        elif info.high_entropy_sections and info.entry_section not in (".text", ".code", "CODE", ""):
+            info.is_packed = True
+            info.confidence = 0.7
+
+        return info
 
     def list_functions(self) -> list[FunctionInfo]:
         """List all functions in the binary."""

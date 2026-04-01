@@ -14,7 +14,7 @@ from rich.prompt import Prompt
 
 from kong import __version__
 from kong.agent.events import Event, EventType
-from kong.agent.supervisor import Supervisor
+from kong.agent.supervisor import PackedBinaryError, Supervisor
 from kong.banner import (
     _ENV_VARS,
     _KEY_EXAMPLES,
@@ -317,10 +317,39 @@ def analyze(
         )
         raise SystemExit(1)
 
+    # Fast packing check BEFORE starting Ghidra (saves minutes)
+    from kong.pe_check import check_pe_packing
+    packing = check_pe_packing(str(binary_path))
+    if packing.is_packed:
+        console.print(f"[bold yellow]Packed binary detected ({packing.confidence:.0%} confidence):[/bold yellow]")
+        for indicator in packing.indicators:
+            console.print(f"  [yellow]{indicator}[/yellow]")
+        console.print()
+        console.print("[cyan]Attempting automatic unpacking via emulation...[/cyan]")
+        try:
+            from kong.unpack import unpack_pe
+            unpacked_path = unpack_pe(str(binary_path))
+            console.print(f"[green]Unpacked successfully:[/green] {unpacked_path}")
+            binary_path = Path(unpacked_path)
+        except Exception as e:
+            console.print(f"[red]Automatic unpacking failed:[/red] {e}")
+            console.print()
+            console.print("[yellow]To analyze a packed binary manually:[/yellow]")
+            console.print("  1. Run the binary in a sandbox/debugger")
+            console.print("  2. Let the unpacker execute")
+            console.print("  3. Dump the process memory (e.g., pe-sieve, Scylla)")
+            console.print("  4. Run: [bold]kong analyze <dumped_binary>[/bold]")
+            raise SystemExit(1)
+
     try:
-        with console.status(
-            "[bold green]Opening binary in Ghidra (this may take 30-60s on first run) ...",
-        ):
+        binary_stem = binary_path.stem
+        project_marker = binary_path.parent / f"{binary_stem}_kong" / "kong" / "kong.gpr"
+        if project_marker.exists():
+            status_msg = "[bold green]Reopening existing Ghidra project ..."
+        else:
+            status_msg = "[bold green]Opening binary in Ghidra (first run — this may take a while) ..."
+
+        with console.status(status_msg):
             client = GhidraClient(
                 binary_path=str(binary_path),
                 install_dir=config.ghidra.install_dir,
@@ -357,6 +386,16 @@ def analyze(
         supervisor.on_event(print_event)
         try:
             supervisor.run()
+        except PackedBinaryError as e:
+            console.print(f"\n[bold red]Packed binary detected![/bold red]")
+            console.print(f"[red]{e}[/red]")
+            console.print()
+            console.print("[yellow]To analyze a packed binary:[/yellow]")
+            console.print("  1. Run the binary in a sandbox/debugger")
+            console.print("  2. Let the unpacker execute")
+            console.print("  3. Dump the process memory (e.g., pe-sieve, Scylla, Process Dump)")
+            console.print("  4. Run: [bold]kong analyze <dumped_binary>[/bold]")
+            raise SystemExit(1)
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         finally:
@@ -366,6 +405,9 @@ def analyze(
         app = KongApp(supervisor)
         try:
             app.run()
+        except PackedBinaryError as e:
+            console.print(f"\n[bold red]Packed binary detected![/bold red] {e}")
+            raise SystemExit(1)
         except KeyboardInterrupt:
             pass
         finally:
@@ -375,44 +417,17 @@ def analyze(
 
 @cli.command()
 @click.argument("binary", type=click.Path(exists=True, dir_okay=False))
-@click.option("--ghidra-dir", default=None, help="Ghidra installation directory.")
-def info(binary: str, ghidra_dir: str | None) -> None:
-    """Show info about a binary."""
-    
-    ghidra_config = GhidraConfig(install_dir=ghidra_dir)
-    if not ghidra_config.install_dir:
-        console.print("[red]Ghidra is not installed or not found.[/red]")
-        raise SystemExit(1)
+def info(binary: str) -> None:
+    """Show info about a binary (fast, no Ghidra needed)."""
+    from kong.pe_analyze import analyze_pe, format_report
 
     try:
-        client = GhidraClient(
-            binary_path=str(Path(binary).resolve()),
-            install_dir=ghidra_config.install_dir,
-            jvm_heap=ghidra_config.jvm_heap,
-        )
-        client.open()
-    except GhidraClientError as e:
-        console.print(f"[red]Failed to open binary:[/red] {e}")
+        analysis = analyze_pe(str(Path(binary).resolve()))
+    except Exception as e:
+        console.print(f"[red]Failed to analyze binary:[/red] {e}")
         raise SystemExit(1)
 
-    bi = client.get_binary_info()
-    functions = client.list_functions()
-
-    console.print(f"[bold]Binary:[/bold] {bi.name}")
-    console.print(f"[bold]Path:[/bold] {bi.path}")
-    console.print(f"[bold]Arch:[/bold] {bi.arch}")
-    console.print(f"[bold]Format:[/bold] {bi.format}")
-    console.print(f"[bold]Endianness:[/bold] {bi.endianness}")
-    console.print(f"[bold]Word Size:[/bold] {bi.word_size * 8}-bit")
-    console.print(f"[bold]Compiler:[/bold] {bi.compiler}")
-    console.print(f"[bold]Functions:[/bold] {len(functions)}")
-
-    # Classification breakdown
-    counts = Counter(f.classification.value for f in functions if f.classification)
-    for cls, count in sorted(counts.items()):
-        console.print(f"  {cls}: {count}")
-
-    client.close()
+    console.print(format_report(analysis))
 
 
 @cli.command()
