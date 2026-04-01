@@ -92,8 +92,13 @@ class GhidraClient:
     def decomp_interface(self) -> Any:
         """Lazily create and cache a shared DecompInterface."""
         if self._decomp_interface is None:
-            from ghidra.app.decompiler import DecompInterface
+            from ghidra.app.decompiler import DecompInterface, DecompileOptions
+            opts = DecompileOptions()
+            opts.setMaxInstructions(100000)
+            opts.setMaxPayloadMBytes(100)
             di = DecompInterface()
+            di.setSimplificationStyle("decompile")
+            di.setOptions(opts)
             di.openProgram(self.program)
             self._decomp_interface = di
         return self._decomp_interface
@@ -682,6 +687,19 @@ class GhidraClient:
                 output=output,
             ))
         return ops
+
+    def get_disassembly(self, addr: int) -> str:
+        """Get disassembly listing for a function as a formatted string."""
+        func = self._get_function_at(addr)
+        listing = self.program.getListing()
+        body = func.getBody()
+        lines: list[str] = []
+        instr = listing.getInstructionAt(body.getMinAddress())
+        while instr is not None and body.contains(instr.getAddress()):
+            offset = int(instr.getAddress().getOffset())
+            lines.append(f"  0x{offset:08x}:  {instr}")
+            instr = instr.getNext()
+        return "\n".join(lines)
 
     def _disassemble_range(self, start: int, end: int) -> list[str]:
         """Get disassembly text for instructions in an address range."""

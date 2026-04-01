@@ -157,10 +157,20 @@ class Analyzer:
         client: GhidraClient,
         llm_client: LLMClient,
         deobfuscator: Deobfuscator | None = None,
+        decompilation_cache: dict[int, str] | None = None,
     ) -> None:
         self.client = client
         self.llm = llm_client
         self._deobfuscator = deobfuscator
+        self._decompilation_cache = decompilation_cache if decompilation_cache is not None else {}
+
+    def _get_decompilation(self, addr: int) -> str:
+        """Get decompilation for an address, using cache when available."""
+        if addr in self._decompilation_cache:
+            return self._decompilation_cache[addr]
+        decomp = self.client.get_decompilation(addr)
+        self._decompilation_cache[addr] = decomp
+        return decomp
 
     def analyze(
         self,
@@ -199,6 +209,7 @@ class Analyzer:
             llm_calls=1,
             signature_applied=sig_applied,
             struct_proposals=response.struct_proposals,
+            variables=[(v.old_name, v.new_name) for v in response.variables],
         )
         if techniques:
             result.obfuscation_techniques = [t.value for t in techniques]
@@ -216,7 +227,14 @@ class Analyzer:
         """Assemble all context the LLM needs to analyze this function."""
         func = item.function
 
-        decompilation = normalize(self.client.get_decompilation(func.address))
+        try:
+            decompilation = normalize(self._get_decompilation(func.address))
+        except Exception:
+            logger.warning(
+                "Decompilation failed for %s, falling back to disassembly",
+                func.address_hex,
+            )
+            decompilation = self.client.get_disassembly(func.address)
 
         caller_snippets = self._get_snippets(item.callers, known_results, limit=3)
         callee_snippets = self._get_snippets(item.callees, known_results, limit=5)
@@ -251,10 +269,14 @@ class Analyzer:
         for addr in addrs[:limit]:
             name = self._resolve_name(addr, known_results)
             try:
-                full = normalize(self.client.get_decompilation(addr))
+                full = normalize(self._get_decompilation(addr))
                 snippet = "\n".join(full.split("\n")[:10])
             except Exception:
-                snippet = ""
+                try:
+                    full = self.client.get_disassembly(addr)
+                    snippet = "\n".join(full.split("\n")[:15])
+                except Exception:
+                    snippet = ""
             if snippet:
                 snippets.append(FunctionSnippet(address=addr, name=name, snippet=snippet))
         return snippets
@@ -422,6 +444,14 @@ class Analyzer:
             except Exception as e:
                 logger.warning("Failed to add comment at 0x%08x: %s", addr, e)
 
+        if response.variables:
+            var_lines = [f"  {v.old_name} \u2192 {v.new_name}" for v in response.variables]
+            var_comment = "Variable renames:\n" + "\n".join(var_lines)
+            try:
+                self.client.add_comment(addr, var_comment)
+            except Exception as e:
+                logger.warning("Failed to add variable rename comment at 0x%08x: %s", addr, e)
+
         return signature_ok
 
     @staticmethod
@@ -519,6 +549,11 @@ class Analyzer:
                 classification=entry.get("classification", ""),
                 comments=entry.get("comments", ""),
                 reasoning=entry.get("reasoning", ""),
+                variables=[
+                    VariableRename(old_name=v["old_name"], new_name=v["new_name"])
+                    for v in entry.get("variables", [])
+                    if "old_name" in v and "new_name" in v
+                ],
                 struct_proposals=Analyzer._parse_struct_proposals(entry),
                 raw=raw,
                 address=_safe_int(entry.get("address", 0)),

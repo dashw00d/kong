@@ -185,6 +185,7 @@ class TestDecompilation:
 
         ghidra_decompiler = MagicMock()
         ghidra_decompiler.DecompInterface = MockDI
+        ghidra_decompiler.DecompileOptions = MagicMock()
         ghidra_task = MagicMock()
         ghidra_task.ConsoleTaskMonitor = MockMonitor
 
@@ -197,7 +198,7 @@ class TestDecompilation:
         }):
             result = client.get_decompilation(0x401000)
             assert "void main" in result
-            di_instance.dispose.assert_called_once()
+            di_instance.openProgram.assert_called_once()
 
     def test_get_decompilation_failure(self, client):
         func = _mock_function(0x401000, "main", 120)
@@ -205,6 +206,7 @@ class TestDecompilation:
 
         mock_result = MagicMock()
         mock_result.decompileCompleted.return_value = False
+        mock_result.getErrorMessage.return_value = "test error"
 
         MockDI = MagicMock()
         di_instance = MagicMock()
@@ -213,6 +215,7 @@ class TestDecompilation:
 
         ghidra_decompiler = MagicMock()
         ghidra_decompiler.DecompInterface = MockDI
+        ghidra_decompiler.DecompileOptions = MagicMock()
         ghidra_task = MagicMock()
         ghidra_task.ConsoleTaskMonitor = MagicMock()
 

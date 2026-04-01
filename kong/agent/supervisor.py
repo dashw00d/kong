@@ -126,6 +126,7 @@ class Supervisor:
             self._run_analysis()
             self._run_cleanup()
             self._run_synthesis()
+            self._reanalyze_low_confidence()
             self._run_export()
         except Exception as e:
             self._emit(Event(
@@ -157,6 +158,39 @@ class Supervisor:
         triage = TriageAgent(self.client, signature_db=self.sig_db)
         result = triage.run()
         self.triage_result = result
+
+        # Pre-populate results for signature-matched functions so they skip LLM analysis.
+        for match in result.signature_matches:
+            sig_result = FunctionResult(
+                address=match.function_address,
+                original_name=match.function_name,
+                name=match.matched_name,
+                signature=match.signature,
+                confidence=100,
+                classification=match.category,
+                comments=match.description,
+            )
+            self.results[match.function_address] = sig_result
+
+            try:
+                self.client.rename_function(match.function_address, match.matched_name)
+            except Exception as e:
+                logger.debug(
+                    "Failed to rename signature match 0x%08x to %s: %s",
+                    match.function_address, match.matched_name, e,
+                )
+
+            if match.signature:
+                try:
+                    self.client.set_function_signature(
+                        match.function_address, match.signature,
+                    )
+                    sig_result.signature_applied = True
+                except Exception as e:
+                    logger.debug(
+                        "Failed to apply signature for 0x%08x: %s",
+                        match.function_address, e,
+                    )
 
         self.binary_info = result.binary_info
         self.functions = result.functions
@@ -230,6 +264,11 @@ class Supervisor:
         for item in all_items:
             func = item.function
 
+            # Skip functions already resolved by signature matching during triage.
+            if func.address in self.results:
+                completed_count += 1
+                continue
+
             if func.classification and func.classification.value == "trivial":
                 result = FunctionResult(
                     address=func.address,
@@ -257,21 +296,28 @@ class Supervisor:
             try:
                 decompilation = self._get_decompilation(func.address)
             except Exception as e:
-                self._emit(Event(
-                    type=EventType.FUNCTION_ERROR,
-                    phase=Phase.ANALYSIS,
-                    message=f"Decompilation failed for {func.name} ({func.address_hex}): {e}",
-                    data={"address": func.address, "error": str(e)},
-                ))
-                result = FunctionResult(
-                    address=func.address,
-                    original_name=func.name,
-                    error=f"Decompilation failed: {e}",
+                logger.warning(
+                    "Decompilation failed for %s, falling back to disassembly: %s",
+                    func.address_hex, e,
                 )
-                self.results[func.address] = result
-                self.stats.record_result(result)
-                completed_count += 1
-                continue
+                try:
+                    decompilation = self.client.get_disassembly(func.address)
+                except Exception:
+                    self._emit(Event(
+                        type=EventType.FUNCTION_ERROR,
+                        phase=Phase.ANALYSIS,
+                        message=f"Decompilation and disassembly both failed for {func.name} ({func.address_hex})",
+                        data={"address": func.address, "error": str(e)},
+                    ))
+                    result = FunctionResult(
+                        address=func.address,
+                        original_name=func.name,
+                        error=f"Decompilation failed: {e}",
+                    )
+                    self.results[func.address] = result
+                    self.stats.record_result(result)
+                    completed_count += 1
+                    continue
 
             techniques = classify_obfuscation(decompilation)
 
@@ -390,7 +436,7 @@ class Supervisor:
 
         items.sort(key=lambda x: len(x[1]))
 
-        analyzer = Analyzer(self.client, self.llm_client)
+        analyzer = Analyzer(self.client, self.llm_client, decompilation_cache=self._decompilation_cache)
         chunks = self._split_into_chunks(items)
         total_chunks = len(chunks)
         processed = 0
@@ -475,6 +521,7 @@ class Supervisor:
                         llm_calls=1,
                         signature_applied=sig_applied,
                         struct_proposals=response.struct_proposals,
+                        variables=[(v.old_name, v.new_name) for v in response.variables],
                     )
                     matched += 1
                 else:
@@ -513,10 +560,18 @@ class Supervisor:
             "",
         ]
 
+        # Scope known functions to only callers/callees of this chunk
+        chunk_addrs = {item.function.address for item, _ in items}
+        relevant_addrs: set[int] = set()
+        for item, _ in items:
+            relevant_addrs.update(item.callers)
+            relevant_addrs.update(item.callees)
+        relevant_addrs -= chunk_addrs
+
         known = {
             addr: r.name
             for addr, r in self.results.items()
-            if r.name and not r.skipped and not r.error
+            if addr in relevant_addrs and r.name and not r.skipped and not r.error
         }
         if known:
             parts.append("### Already Identified Functions")
@@ -539,7 +594,7 @@ class Supervisor:
         assert self.llm_client is not None
         func = item.function
         deobfuscator = Deobfuscator(self.client, self.llm_client)
-        analyzer = Analyzer(self.client, self.llm_client, deobfuscator=deobfuscator)
+        analyzer = Analyzer(self.client, self.llm_client, deobfuscator=deobfuscator, decompilation_cache=self._decompilation_cache)
         result = analyzer.analyze(
             item,
             binary_info=self.binary_info,
@@ -615,8 +670,25 @@ class Supervisor:
                 },
             ))
 
-            apply_unified_structs(self.client, unified)
+            affected_addrs = apply_unified_structs(self.client, unified)
             structs_created = len(unified)
+
+            # Invalidate decompilation cache for affected functions so
+            # synthesis and export see the improved type-annotated output
+            for addr in affected_addrs:
+                self._decompilation_cache.pop(addr, None)
+                try:
+                    self._get_decompilation(addr)  # re-cache with new types
+                except Exception:
+                    logger.debug("Re-decompilation failed for 0x%08x after struct application", addr)
+
+            if affected_addrs:
+                self._emit(Event(
+                    type=EventType.CLEANUP_TYPES_UNIFIED,
+                    phase=Phase.CLEANUP,
+                    message=f"Re-decompiled {len(affected_addrs)} functions with new struct types.",
+                    data={"redecompiled": len(affected_addrs)},
+                ))
 
             for us in unified:
                 self._emit(Event(
@@ -758,6 +830,72 @@ class Supervisor:
             phase=Phase.SYNTHESIS,
             message="Synthesis complete.",
         ))
+
+    def _reanalyze_low_confidence(self) -> None:
+        """Re-analyze functions with low confidence using post-synthesis context."""
+        if self.llm_client is None:
+            return
+
+        low_conf = [
+            r for r in self.results.values()
+            if r.confidence > 0 and r.confidence < 50
+            and not r.skipped and not r.error
+        ]
+        if not low_conf:
+            return
+
+        self._emit(Event(
+            type=EventType.PHASE_START,
+            phase=Phase.ANALYSIS,
+            message=f"Re-analyzing {len(low_conf)} low-confidence functions...",
+        ))
+
+        # Gather known struct types from cleanup phase
+        known_types = []
+        if self.struct_accumulator.proposal_count > 0:
+            try:
+                known_types = [
+                    us.definition
+                    for us in self.struct_accumulator.unify()
+                ]
+            except Exception:
+                pass
+
+        reanalyzed = 0
+        for result in low_conf:
+            addr = result.address
+            item = self.queue.get_by_address(addr)
+            if item is None:
+                continue
+
+            try:
+                analyzer = Analyzer(
+                    self.client, self.llm_client,
+                    decompilation_cache=self._decompilation_cache,
+                )
+                new_result = analyzer.analyze(
+                    item,
+                    binary_info=self.binary_info,
+                    known_results=self.results,
+                    strings=self.strings,
+                    known_types=known_types,
+                    model=self.llm_client.model,
+                )
+                # Only accept if confidence improved
+                if new_result.confidence > result.confidence:
+                    new_result.llm_calls = result.llm_calls + new_result.llm_calls
+                    self.results[addr] = new_result
+                    self.stats.llm_calls += 1
+                    reanalyzed += 1
+            except Exception as e:
+                logger.debug("Re-analysis failed for 0x%08x: %s", addr, e)
+
+        if reanalyzed:
+            self._emit(Event(
+                type=EventType.PHASE_COMPLETE,
+                phase=Phase.ANALYSIS,
+                message=f"Re-analysis improved {reanalyzed}/{len(low_conf)} functions.",
+            ))
 
     def _run_export(self) -> None:
         """Generate output files."""

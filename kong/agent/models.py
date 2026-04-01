@@ -83,3 +83,4 @@ class FunctionResult:
     struct_proposals: list[StructProposal] = field(default_factory=list)
     obfuscation_techniques: list[str] = field(default_factory=list)
     deobfuscation_tool_calls: int = 0
+    variables: list[tuple[str, str]] = field(default_factory=list)  # (old_name, new_name)

@@ -53,6 +53,7 @@ def _build_function_entry(result: FunctionResult) -> dict[str, str | int | list[
         "comments": result.comments,
         "reasoning": result.reasoning,
         "obfuscation_techniques": result.obfuscation_techniques,
+        "variables": [{"old": old, "new": new} for old, new in result.variables],
     }
 
 

@@ -70,8 +70,8 @@ class WorkQueue:
                 depth=depth,
                 callers=callers_map.get(addr, []),
                 callees=callees_map.get(addr, []),
-                # Priority: depth first (bottom-up), then size (smaller first)
-                priority=depth * 1_000_000 + func.size,
+                # Priority: depth first (bottom-up), then in-degree (more callers first), then size (smaller first)
+                priority=depth * 1_000_000 - len(callers_map.get(addr, [])) * 1_000 + func.size,
             )
             items.append(item)
             self._by_address[addr] = item
