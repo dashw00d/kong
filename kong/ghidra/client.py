@@ -130,11 +130,22 @@ class GhidraClient:
         project_location = Path(self.binary_path).parent / f"{binary_name}_kong"
         self._clean_stale_locks(project_location)
 
-        self._project, self._program = _setup_project(
-            self.binary_path,
-            project_location=str(project_location),
-            project_name="kong",
-        )
+        try:
+            self._project, self._program = _setup_project(
+                self.binary_path,
+                project_location=str(project_location),
+                project_name="kong",
+            )
+        except Exception as e:
+            # Corrupt project — nuke it and try fresh
+            import shutil
+            logger.warning("Ghidra project corrupt (%s) — deleting and reimporting", e)
+            shutil.rmtree(project_location, ignore_errors=True)
+            self._project, self._program = _setup_project(
+                self.binary_path,
+                project_location=str(project_location),
+                project_name="kong",
+            )
         GhidraScriptUtil.acquireBundleHostReference()
         self._flat_api = FlatProgramAPI(self._program)
 
@@ -149,7 +160,10 @@ class GhidraClient:
             else:
                 logger.info("New project — running Ghidra auto-analysis (this is slow)")
             _analyze_program(self._flat_api, self._program)
-            self.save_project()
+            # CRITICAL: Save immediately. This is the 30-minute analysis we must not lose.
+            logger.info("Analysis complete — saving Ghidra project NOW...")
+            self._project.save(self._program)
+            logger.info("Ghidra project saved successfully after initial analysis")
             func_count = self._program.getFunctionManager().getFunctionCount()
 
         logger.info(
@@ -161,12 +175,23 @@ class GhidraClient:
     def save_project(self) -> None:
         """Flush the Ghidra project to disk so progress survives kills."""
         if self._project is None or self._program is None:
+            logger.warning("save_project called but project=%s program=%s",
+                           self._project, self._program)
             return
         try:
             self._project.save(self._program)
             logger.info("Ghidra project saved to disk")
-        except Exception:
-            logger.debug("Failed to save Ghidra project", exc_info=True)
+        except Exception as e:
+            logger.error("project.save() failed: %s — trying fallback", e)
+            # Fallback: save via the domain file
+            try:
+                from ghidra.util.task import ConsoleTaskMonitor
+                df = self._program.getDomainFile()
+                if df is not None:
+                    df.save(ConsoleTaskMonitor())
+                    logger.info("Ghidra project saved via DomainFile fallback")
+            except Exception as e2:
+                logger.error("DomainFile fallback also failed: %s", e2)
 
     def close(self) -> None:
         """Close the program and release resources."""

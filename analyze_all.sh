@@ -61,10 +61,11 @@ for f in "${files[@]}"; do
     outdir="$DIR/kong_output_$name"
     logfile="$outdir/kong.log"
 
-    # Skip if already has results (analysis_state.json exists with content)
-    if [ -f "$outdir/analysis_state.json" ] && [ -s "$outdir/analysis_state.json" ]; then
+    # Skip only if a previous run fully completed with real results
+    # (analysis.json > 10KB means actual function data, not a stub from a failed run)
+    if [ -f "$outdir/analysis.json" ] && [ "$(stat -c%s "$outdir/analysis.json" 2>/dev/null || echo 0)" -gt 10000 ]; then
         echo ""
-        echo "=== Skipping: $name (previous results found in $outdir) ==="
+        echo "=== Skipping: $name (completed results in $outdir) ==="
         skipped=$((skipped + 1))
         continue
     fi

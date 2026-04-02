@@ -917,7 +917,10 @@ class Supervisor:
         for addr, result in self.results.items():
             if result.skipped or result.error:
                 continue
-            decomp = self._get_decompilation(addr)
+            try:
+                decomp = self._get_decompilation(addr)
+            except Exception:
+                continue
             if decomp:
                 decompilations[addr] = normalize(decomp)
 
@@ -1070,7 +1073,10 @@ class Supervisor:
         ]
         decompilations: dict[int, str] = {}
         for addr in exportable_addrs:
-            decomp = self._get_decompilation(addr)
+            try:
+                decomp = self._get_decompilation(addr)
+            except Exception:
+                continue
             if decomp:
                 decompilations[addr] = normalize(decomp)
 
